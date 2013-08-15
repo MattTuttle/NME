@@ -22,7 +22,9 @@ enum PixelFormat
    pfHardware     = 0x10,
    pfARGB4444     = 0x11,
    pfRGB565       = 0x12,
-   
+   pfPVRTC_4      = 0x20,
+   pfPVRTC_2      = 0x21,
+
    pfHasAlpha     = 0x01,
    pfSwapRB       = 0x02,
 };

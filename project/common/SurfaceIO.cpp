@@ -113,7 +113,80 @@ struct MySrcManager
    }
  };
 
-static Surface *TryJPEG(FILE *inFile,const uint8 *inData, int inDataLen)
+typedef struct _PVRTexHeader
+{
+    uint32_t headerLength;
+    uint32_t height;
+    uint32_t width;
+    uint32_t numMipmaps;
+    uint32_t flags;
+    uint32_t dataLength;
+    uint32_t bpp;
+    uint32_t bitmaskRed;
+    uint32_t bitmaskGreen;
+    uint32_t bitmaskBlue;
+    uint32_t bitmaskAlpha;
+    uint32_t pvrTag;
+    uint32_t numSurfs;
+} PVRTexHeader;
+
+enum
+{
+    kPVRTextureFlagTypePVRTC_2 = 24,
+    kPVRTextureFlagTypePVRTC_4
+};
+
+static Surface *DecodePVR(FILE *inFile, const uint8 *inData, int inDataLen)
+{
+   Surface *result = 0;
+   PVRTexHeader *header = 0;
+
+   if (inFile)
+   {
+      header = (PVRTexHeader*)malloc(sizeof(PVRTexHeader));
+      fread(header, sizeof(PVRTexHeader), 1, inFile);
+   }
+   else
+   {
+      header = (PVRTexHeader*)inData;
+   }
+
+   uint32_t pvrTag = header->pvrTag;
+   if ('P' == ((pvrTag >>  0) & 0xFF) &&
+       'V' == ((pvrTag >>  8) & 0xFF) &&
+       'R' == ((pvrTag >> 16) & 0xFF) &&
+       '!' == ((pvrTag >> 24) & 0xFF))
+   {
+      uint32_t formatFlags = header->flags && 0xFF;
+      PixelFormat internalFormat;
+      if (formatFlags == kPVRTextureFlagTypePVRTC_4 || formatFlags == kPVRTextureFlagTypePVRTC_2)
+      {
+         if (formatFlags == kPVRTextureFlagTypePVRTC_4)
+            internalFormat = pfPVRTC_4;
+         else if (formatFlags == kPVRTextureFlagTypePVRTC_2)
+            internalFormat = pfPVRTC_2;
+
+         result = new SimpleSurface(header->width, header->height, internalFormat);
+         result->IncRef();
+
+         RenderTarget target = result->BeginRender(Rect(header->width, header->height));
+         if (inFile)
+         {
+            fread(target.mSoftPtr, sizeof(uint8), header->dataLength, inFile);
+         }
+         else
+         {
+            memcpy(target.mSoftPtr, inData + sizeof(PVRTexHeader), header->dataLength);
+         }
+         result->EndRender();
+      }
+   }
+
+   if (inFile) free(header);
+   return result;
+}
+
+static Surface *DecodeJPEG(FILE *inFile,const uint8 *inData, int inDataLen)
 {
    struct jpeg_decompress_struct cinfo;
 
@@ -267,7 +340,7 @@ static bool EncodeJPG(Surface *inSurface, ByteArray *outBytes,double inQuality)
    QuickVec<uint8> row_buf(w*3);
 
    jpeg_create_compress(&cinfo);
- 
+
 
    // Establish the setjmp return context for ErrorFunction to use
    if (setjmp(jpegError.on_error))
@@ -278,21 +351,21 @@ static bool EncodeJPG(Surface *inSurface, ByteArray *outBytes,double inQuality)
 
 
    cinfo.dest = (jpeg_destination_mgr *)&dest;
- 
+
    cinfo.image_width      = w;
    cinfo.image_height     = h;
    cinfo.input_components = 3;
    cinfo.in_color_space   = JCS_RGB;
- 
+
    jpeg_set_defaults(&cinfo);
    jpeg_set_quality (&cinfo, (int)(inQuality * 100), true);
    jpeg_start_compress(&cinfo, true);
- 
+
    JSAMPROW row_pointer = &row_buf[0];
 
    int c0_idx = gC0IsRed ? 0 : 2;
    int c1_idx = 2-c0_idx;
- 
+
    /* main code to write jpeg data */
    while (cinfo.next_scanline < cinfo.image_height)
    {
@@ -312,7 +385,7 @@ static bool EncodeJPG(Surface *inSurface, ByteArray *outBytes,double inQuality)
    jpeg_finish_compress(&cinfo);
 
    *outBytes = ByteArray(dest.mOutput);
- 
+
    return true;
 }
 
@@ -333,11 +406,11 @@ void user_write_data(png_structp png_ptr, png_bytep data, png_size_t length)
 {
     QuickVec<unsigned char> *buffer = (QuickVec<unsigned char> *)png_get_io_ptr(png_ptr);
     buffer->append((unsigned char *)data,(int)length);
-} 
+}
 void user_flush_data(png_structp png_ptr) { }
 
 
-static Surface *TryPNG(FILE *inFile,const uint8 *inData, int inDataLen)
+static Surface *DecodePNG(FILE *inFile,const uint8 *inData, int inDataLen)
 {
    png_structp png_ptr;
    png_infop info_ptr;
@@ -420,10 +493,10 @@ static Surface *TryPNG(FILE *inFile,const uint8 *inData, int inDataLen)
    result = new SimpleSurface(width,height, (has_alpha) ? pfARGB : pfXRGB);
    result->IncRef();
    target = result->BeginRender(Rect(width,height));
-   
+
    /* if the image is interlaced, run multiple passes */
    int number_of_passes = png_set_interlace_handling(png_ptr);
-   
+
    for (int pass = 0; pass < number_of_passes; pass++)
    {
       for (int i = 0; i < height; i++)
@@ -484,7 +557,7 @@ static bool EncodePNG(Surface *inSurface, ByteArray *outBytes)
 
    bool swap = (gC0IsRed == (((inSurface->Format() & pfSwapRB ))>0) );
    bool do_alpha = color_type==PNG_COLOR_TYPE_RGBA;
-   
+
    if (!swap && do_alpha)
    {
       QuickVec<png_bytep> row_pointers(h);
@@ -550,11 +623,16 @@ Surface *Surface::Load(const OSChar *inFilename)
       return 0;
    }
 
-   Surface *result = TryJPEG(file,0,0);
+   Surface *result = DecodePVR(file,0,0);
    if (!result)
    {
       rewind(file);
-      result = TryPNG(file,0,0);
+      result = DecodeJPEG(file,0,0);
+   }
+   if (!result)
+   {
+      rewind(file);
+      result = DecodePNG(file,0,0);
    }
 
    fclose(file);
@@ -566,9 +644,11 @@ Surface *Surface::LoadFromBytes(const uint8 *inBytes,int inLen)
    if (!inBytes || !inLen)
       return 0;
 
-   Surface *result = TryJPEG(0,inBytes,inLen);
+   Surface *result = DecodePVR(0,inBytes,inLen);
    if (!result)
-      result = TryPNG(0,inBytes,inLen);
+      result = DecodeJPEG(0,inBytes,inLen);
+   if (!result)
+      result = DecodePNG(0,inBytes,inLen);
 
    return result;
 }
@@ -577,7 +657,7 @@ bool Surface::Encode( ByteArray *outBytes,bool inPNG,double inQuality)
 {
    if (inPNG)
       return EncodePNG(this,outBytes);
-   
+
    else
       return EncodeJPG(this,outBytes,inQuality);
 }
